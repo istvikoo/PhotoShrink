@@ -255,6 +255,23 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Folders that hold results, in list order, without repeats.
+    var outputFolders: [URL] {
+        var seen = Set<URL>()
+        return items.compactMap { $0.result?.url.deletingLastPathComponent() }.filter { seen.insert($0).inserted }
+    }
+
+    /// Opens the folder with results; with several folders, shows a result from each in Finder.
+    func revealOutputFolders() {
+        let folders = outputFolders
+        if folders.count == 1 {
+            NSWorkspace.shared.open(folders[0])
+        } else {
+            let files = folders.compactMap { dir in items.first { $0.result?.url.deletingLastPathComponent() == dir }?.result?.url }
+            NSWorkspace.shared.activateFileViewerSelecting(files)
+        }
+    }
+
     /// Adds files and folders. Scanning runs in the background so big folders don't freeze the window.
     func add(_ urls: [URL]) {
         let known = Set(items.map(\.url))
@@ -507,25 +524,41 @@ struct ContentView: View {
         } isTargeted: { hovering in model.dropHover = hovering }
     }
 
+    // Left and right groups get equal flexible width, so the middle button stays centered.
     private var footer: some View {
-        HStack {
-            Button { openFiles() } label: { Label(tr("Додати", "Add"), systemImage: "plus") }
-            Button(tr("Очистити", "Clear")) { model.clear() }
-                .disabled(model.items.isEmpty || model.isProcessing)
-            if model.scansRunning > 0 {
-                ProgressView().controlSize(.small)
-                Text(tr("Пошук фото…", "Finding photos…")).foregroundStyle(.secondary)
+        HStack(spacing: 12) {
+            HStack {
+                Button { openFiles() } label: { Label(tr("Додати", "Add"), systemImage: "plus") }
+                Button(tr("Очистити", "Clear")) { model.clear() }
+                    .disabled(model.items.isEmpty || model.isProcessing)
+                if model.scansRunning > 0 {
+                    ProgressView().controlSize(.small)
+                    Text(tr("Пошук фото…", "Finding photos…")).foregroundStyle(.secondary).lineLimit(1)
+                }
             }
-            Spacer()
-            if model.savedBytes > 0 {
-                Text(tr("Зекономлено", "Saved") + " " + formatBytes(model.savedBytes))
-                    .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if !model.outputFolders.isEmpty {
+                Button { model.revealOutputFolders() } label: {
+                    Label(model.outputFolders.count > 1 ? tr("Відкрити папки", "Open folders") : tr("Відкрити папку", "Open folder"),
+                          systemImage: "folder")
+                }
+                .help(tr("Показати стиснуті файли у Finder", "Show compressed files in Finder"))
             }
-            if model.isProcessing { ProgressView().controlSize(.small) }
-            Button(tr("Стиснути", "Compress")) { start() }
-                .keyboardShortcut(.defaultAction)
-                .buttonStyle(.borderedProminent)
-                .disabled(model.items.isEmpty || model.isProcessing || megapixels <= 0)
+
+            HStack {
+                if model.savedBytes > 0 {
+                    Text(tr("Зекономлено", "Saved") + " " + formatBytes(model.savedBytes))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                if model.isProcessing { ProgressView().controlSize(.small) }
+                Button(tr("Стиснути", "Compress")) { start() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.items.isEmpty || model.isProcessing || megapixels <= 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
         }
     }
 

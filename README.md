@@ -4,6 +4,8 @@ A small native macOS app that shrinks photos to a given number of **megapixels**
 
 [Українською ↓](#українською)
 
+<p align="center"><img src="docs/screenshot.png" width="600" alt="PhotoShrink window"></p>
+
 ## Features
 
 - Set the target size in megapixels (presets 2 / 5 / 8 / 12 / 24 or any value)

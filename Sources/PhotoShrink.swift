@@ -17,14 +17,12 @@ enum AppLanguage: String, CaseIterable, Identifiable {
     }
 }
 
-/// True when the UI should be English: chosen in settings, or system language isn't Ukrainian.
+/// True when the UI should be English: chosen in the menu, or the system language isn't Ukrainian.
 func isEnglish() -> Bool {
     switch AppLanguage(rawValue: UserDefaults.standard.string(forKey: "language") ?? "") ?? .system {
     case .uk: return false
     case .en: return true
-    case .system:
-        let preferred = Locale.preferredLanguages.first ?? "en"
-        return !preferred.hasPrefix("uk")
+    case .system: return !(Locale.preferredLanguages.first ?? "en").hasPrefix("uk")
     }
 }
 
@@ -49,9 +47,8 @@ enum OutputFormat: String, CaseIterable, Identifiable {
     }
 }
 
-enum OutputLocation: String, CaseIterable, Identifiable {
+enum OutputLocation: String {
     case nextToOriginal, customFolder
-    var id: String { rawValue }
 }
 
 struct CompressOptions: Sendable {
@@ -83,15 +80,46 @@ struct CompressResult: Sendable {
 }
 
 enum Compressor {
-    static func pixelSize(of url: URL) -> (Int, Int)? {
-        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
-              let w = props[kCGImagePropertyPixelWidth] as? Int,
-              let h = props[kCGImagePropertyPixelHeight] as? Int else { return nil }
-        return (w, h)
+    struct Info: Sendable {
+        let width: Int
+        let height: Int
+        let bytes: Int64
     }
 
-    static func compress(_ url: URL, options o: CompressOptions) throws -> CompressResult {
+    /// Reads only the header: pixel size and file size.
+    static func info(of url: URL) -> Info? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? Int,
+              let h = props[kCGImagePropertyPixelHeight] as? Int, w > 0, h > 0
+        else { return nil }
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        return Info(width: w, height: h, bytes: Int64(size))
+    }
+
+    /// Small preview for the list.
+    static func thumbnail(of url: URL, maxPixels: Int) -> CGImage? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary)
+        else { return nil }
+        // JPEG's embedded EXIF thumbnail is tiny and often letterboxed (Canon adds black bars),
+        // so for JPEG decode a downscaled copy (ImageIO does this fast). HEIC/RAW previews are fine.
+        let isJPEG = (CGImageSourceGetType(src) as String?) == UTType.jpeg.identifier
+        let opts: [CFString: Any] = [
+            isJPEG ? kCGImageSourceCreateThumbnailFromImageAlways : kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixels,
+            kCGImageSourceShouldCacheImmediately: true,
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
+    }
+
+    /// - Parameter replacing: a previous result of the same photo that should be replaced.
+    static func compress(_ url: URL, options o: CompressOptions, replacing old: URL? = nil) throws -> CompressResult {
+        // Frees temporary ImageIO objects right after each photo.
+        try autoreleasepool { try compressImpl(url, o, replacing: old) }
+    }
+
+    private static func compressImpl(_ url: URL, _ o: CompressOptions, replacing old: URL?) throws -> CompressResult {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
               let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
               let w = props[kCGImagePropertyPixelWidth] as? Int,
@@ -109,29 +137,29 @@ enum Compressor {
             kCGImageSourceThumbnailMaxPixelSize: maxSide,
             kCGImageSourceShouldCacheImmediately: true,
         ]
-        guard let image = CGImageSourceCreateThumbnailAtIndex(src, 0, thumbOpts as CFDictionary)
+        guard var image = CGImageSourceCreateThumbnailAtIndex(src, 0, thumbOpts as CFDictionary)
         else { throw CompressError.cannotResize }
 
-        // Pick output type.
-        let writable = (CGImageDestinationCopyTypeIdentifiers() as? [String]) ?? []
+        // Pick output type; fall back to JPEG if the system can't write it (e.g. RAW).
         var typeID: String
         switch o.format {
         case .heic: typeID = UTType.heic.identifier
         case .jpeg: typeID = UTType.jpeg.identifier
         case .original: typeID = (CGImageSourceGetType(src) as String?) ?? UTType.jpeg.identifier
         }
-        if !writable.contains(typeID) { typeID = UTType.jpeg.identifier }
-        let ext: String = {
-            if typeID == UTType.jpeg.identifier { return "jpg" }
-            return UTType(typeID)?.preferredFilenameExtension ?? "jpg"
-        }()
+        if !writableTypes.contains(typeID) { typeID = UTType.jpeg.identifier }
+        let ext = typeID == UTType.jpeg.identifier ? "jpg" : (UTType(typeID)?.preferredFilenameExtension ?? "jpg")
 
-        // Output path.
+        // JPEG has no transparency: put transparent images on white instead of black.
+        if typeID == UTType.jpeg.identifier { image = flattenedOnWhite(image) }
+
+        // Output path. The file is created right away so parallel jobs never pick the same name.
         let dir = o.outputDir ?? url.deletingLastPathComponent().appendingPathComponent(outputFolderName(), isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let outURL = uniqueURL(in: dir, base: url.deletingPathExtension().lastPathComponent, ext: ext)
+        if let old { try? FileManager.default.removeItem(at: old) }
+        let outURL = try reserveUniqueURL(in: dir, base: url.deletingPathExtension().lastPathComponent, ext: ext)
 
-        // Metadata: keep EXIF/GPS/etc., but orientation is already applied to pixels.
+        // Metadata: keep EXIF/GPS/etc., but orientation is already applied to the pixels.
         var outProps: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: o.quality]
         if o.keepMetadata {
             for key in [kCGImagePropertyExifDictionary, kCGImagePropertyGPSDictionary,
@@ -150,46 +178,74 @@ enum Compressor {
         }
         outProps[kCGImagePropertyOrientation] = 1
 
-        guard let dest = CGImageDestinationCreateWithURL(outURL as CFURL, typeID as CFString, 1, nil)
-        else { throw CompressError.cannotWrite }
+        guard let dest = CGImageDestinationCreateWithURL(outURL as CFURL, typeID as CFString, 1, nil) else {
+            try? FileManager.default.removeItem(at: outURL)
+            throw CompressError.cannotWrite
+        }
         CGImageDestinationAddImage(dest, image, outProps as CFDictionary)
         guard CGImageDestinationFinalize(dest) else {
             try? FileManager.default.removeItem(at: outURL)
             throw CompressError.cannotWrite
         }
 
-        let bytes = (try? FileManager.default.attributesOfItem(atPath: outURL.path)[.size] as? Int64) ?? 0
-        return CompressResult(url: outURL, width: image.width, height: image.height, bytes: bytes)
+        let bytes = (try? outURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        return CompressResult(url: outURL, width: image.width, height: image.height, bytes: Int64(bytes))
     }
 
-    private static func uniqueURL(in dir: URL, base: String, ext: String) -> URL {
-        var candidate = dir.appendingPathComponent(base).appendingPathExtension(ext)
-        var n = 2
-        while FileManager.default.fileExists(atPath: candidate.path) {
-            candidate = dir.appendingPathComponent("\(base) (\(n))").appendingPathExtension(ext)
+    private static let writableTypes = Set((CGImageDestinationCopyTypeIdentifiers() as? [String]) ?? [])
+
+    /// Creates an empty file with a free name ("name.heic", "name (2).heic", …) and returns it.
+    /// O_EXCL makes the check-and-create atomic, so two jobs can't grab the same name.
+    private static func reserveUniqueURL(in dir: URL, base: String, ext: String) throws -> URL {
+        var n = 1
+        while true {
+            let name = n == 1 ? base : "\(base) (\(n))"
+            let candidate = dir.appendingPathComponent(name).appendingPathExtension(ext)
+            let fd = open(candidate.path, O_CREAT | O_EXCL | O_WRONLY, mode_t(0o644))
+            if fd >= 0 { close(fd); return candidate }
+            if errno != EEXIST { throw CompressError.cannotWrite }
             n += 1
         }
-        return candidate
+    }
+
+    private static func flattenedOnWhite(_ image: CGImage) -> CGImage {
+        switch image.alphaInfo {
+        case .none, .noneSkipFirst, .noneSkipLast: return image
+        default: break
+        }
+        let space = image.colorSpace.flatMap { $0.model == .rgb ? $0 : nil } ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        let rect = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        guard let ctx = CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: 8,
+                                  bytesPerRow: 0, space: space,
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
+        else { return image }
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        ctx.fill(rect)
+        ctx.draw(image, in: rect)
+        return ctx.makeImage() ?? image
     }
 }
 
 // MARK: - Model
 
-struct PhotoItem: Identifiable {
-    enum Status { case pending, working, done, failed(String) }
+struct PhotoItem: Identifiable, Sendable {
+    enum Status: Sendable { case pending, working, done, failed(String) }
     let id = UUID()
     let url: URL
     let originalBytes: Int64
     let originalMP: Double
     var status: Status = .pending
     var result: CompressResult?
+
+    var isDone: Bool { if case .done = status { return true }; return false }
 }
 
 @MainActor
 final class AppModel: ObservableObject {
     static let shared = AppModel()
-    @Published var items: [PhotoItem] = []
-    @Published var isProcessing = false
+    @Published private(set) var items: [PhotoItem] = []
+    @Published private(set) var isProcessing = false
+    @Published private(set) var scansRunning = 0
     @Published var dropHover = false
 
     var savedBytes: Int64 {
@@ -199,27 +255,42 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Adds files and folders. Scanning runs in the background so big folders don't freeze the window.
     func add(_ urls: [URL]) {
-        let known = Set(items.map { $0.url })
-        for url in expand(urls) where !known.contains(url) {
-            guard let (w, h) = Compressor.pixelSize(of: url) else { continue }
-            let bytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
-            items.append(PhotoItem(url: url, originalBytes: bytes, originalMP: Double(w * h) / 1_000_000))
+        let known = Set(items.map(\.url))
+        scansRunning += 1
+        Task.detached(priority: .userInitiated) {
+            var seen = known
+            var found: [PhotoItem] = []
+            for url in Self.expand(urls) where seen.insert(url).inserted {
+                guard let info = Compressor.info(of: url) else { continue }
+                found.append(PhotoItem(url: url, originalBytes: info.bytes,
+                                       originalMP: Double(info.width * info.height) / 1_000_000))
+            }
+            await self.append(found)
         }
     }
 
-    /// Files are taken as-is; folders are scanned (recursively) for images.
-    private func expand(_ urls: [URL]) -> [URL] {
+    private func append(_ found: [PhotoItem]) {
+        scansRunning -= 1
+        // Another scan may have finished meanwhile, so check for duplicates again.
+        let known = Set(items.map(\.url))
+        items.append(contentsOf: found.filter { !known.contains($0.url) })
+    }
+
+    /// Files are taken as-is; folders are scanned recursively for images.
+    nonisolated private static func expand(_ urls: [URL]) -> [URL] {
         var out: [URL] = []
-        for url in urls {
+        for url in urls.map(\.standardizedFileURL) {
             var isDir: ObjCBool = false
             guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { continue }
             if isDir.boolValue {
+                // skipsPackageDescendants: don't dig into "Photos Library.photoslibrary" and similar.
                 let e = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.contentTypeKey],
-                                                       options: [.skipsHiddenFiles])
+                                                       options: [.skipsHiddenFiles, .skipsPackageDescendants])
                 while let f = e?.nextObject() as? URL {
                     if allOutputFolderNames.contains(f.lastPathComponent) { e?.skipDescendants(); continue }
-                    if isImage(f) { out.append(f) }
+                    if isImage(f) { out.append(f.standardizedFileURL) }
                 }
             } else if isImage(url) {
                 out.append(url)
@@ -228,9 +299,8 @@ final class AppModel: ObservableObject {
         return out
     }
 
-    private func isImage(_ url: URL) -> Bool {
-        let type = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType
-        return type?.conforms(to: .image) ?? false
+    nonisolated private static func isImage(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.conforms(to: .image) ?? false
     }
 
     func clear() { if !isProcessing { items.removeAll() } }
@@ -238,49 +308,73 @@ final class AppModel: ObservableObject {
     func remove(_ id: UUID) { if !isProcessing { items.removeAll { $0.id == id } } }
 
     func process(_ options: CompressOptions) {
-        guard !isProcessing else { return }
-        let todo = items.indices.filter { if case .done = items[$0].status { return false }; return true }
-        guard !todo.isEmpty else { return }
-        isProcessing = true
-        for i in todo { items[i].status = .pending }
+        guard !isProcessing, !items.isEmpty else { return }
+        var todo = items.indices.filter { !items[$0].isDone }
+        // Everything is already done: the user changed settings and wants to redo all of them.
+        if todo.isEmpty { todo = Array(items.indices) }
 
-        let jobs = todo.map { (items[$0].id, items[$0].url) }
+        isProcessing = true
+        var jobs: [(id: UUID, url: URL, old: URL?)] = []
+        for i in todo {
+            jobs.append((items[i].id, items[i].url, items[i].result?.url))
+            items[i].status = .pending
+            items[i].result = nil
+        }
         let limit = max(2, ProcessInfo.processInfo.activeProcessorCount / 2)
 
-        Task { @MainActor in
+        Task {
             await withTaskGroup(of: (UUID, Result<CompressResult, Error>).self) { group in
                 var running = 0
-                for (id, url) in jobs {
+                for job in jobs {
                     if running >= limit, let (doneID, outcome) = await group.next() {
-                        self.apply(doneID, outcome)
+                        apply(doneID, outcome)
                         running -= 1
                     }
-                    self.setStatus(id, .working)
-                    group.addTask { (id, Result { try Compressor.compress(url, options: options) }) }
+                    update(job.id) { $0.status = .working }
+                    group.addTask {
+                        (job.id, Result { try Compressor.compress(job.url, options: options, replacing: job.old) })
+                    }
                     running += 1
                 }
-                for await (doneID, outcome) in group { self.apply(doneID, outcome) }
+                for await (doneID, outcome) in group { apply(doneID, outcome) }
             }
-            self.isProcessing = false
+            isProcessing = false
         }
     }
 
     private func apply(_ id: UUID, _ outcome: Result<CompressResult, Error>) {
-        switch outcome {
-        case .success(let r): finish(id, r)
-        case .failure(let e): setStatus(id, .failed(e.localizedDescription))
+        update(id) { item in
+            switch outcome {
+            case .success(let r): item.result = r; item.status = .done
+            case .failure(let e): item.status = .failed(e.localizedDescription)
+            }
         }
     }
 
-    private func setStatus(_ id: UUID, _ s: PhotoItem.Status) {
-        if let i = items.firstIndex(where: { $0.id == id }) { items[i].status = s }
+    private func update(_ id: UUID, _ change: (inout PhotoItem) -> Void) {
+        if let i = items.firstIndex(where: { $0.id == id }) { change(&items[i]) }
     }
+}
 
-    private func finish(_ id: UUID, _ r: CompressResult) {
-        if let i = items.firstIndex(where: { $0.id == id }) {
-            items[i].result = r
-            items[i].status = .done
-        }
+// MARK: - Thumbnails (loaded only for visible rows, cached)
+
+@MainActor
+final class ThumbnailLoader: ObservableObject {
+    @Published private(set) var image: NSImage?
+
+    private static let cache: NSCache<NSURL, NSImage> = {
+        let c = NSCache<NSURL, NSImage>()
+        c.countLimit = 500
+        return c
+    }()
+
+    func load(_ url: URL) async {
+        if let cached = Self.cache.object(forKey: url as NSURL) { image = cached; return }
+        let cg = await Task.detached(priority: .utility) { Compressor.thumbnail(of: url, maxPixels: 120) }.value
+        guard let cg, !Task.isCancelled else { return }
+        let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        Self.cache.setObject(img, forKey: url as NSURL)
+        image = img
     }
 }
 
@@ -300,7 +394,6 @@ struct ContentView: View {
     @AppStorage("location") private var location: OutputLocation = .nextToOriginal
     @AppStorage("customFolder") private var customFolder: String = ""
     @AppStorage("language") private var language: AppLanguage = .system
-    @AppStorage("autoCheckUpdates") private var autoCheckUpdates = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -313,7 +406,7 @@ struct ContentView: View {
             footer
                 .padding(12)
         }
-        .frame(minWidth: 580, minHeight: 540)
+        .frame(minWidth: 580, minHeight: 460)
         .navigationTitle(tr("Стиснення фото", "Photo Compressor"))
         .id(language)   // redraw everything when the language changes
     }
@@ -358,7 +451,8 @@ struct ContentView: View {
                 Text(tr("Зберегти в", "Save to"))
                 HStack {
                     Picker("", selection: $location) {
-                        Text(tr("Папку «Стиснуті» поруч з оригіналом", "“Compressed” folder next to original")).tag(OutputLocation.nextToOriginal)
+                        Text(tr("Папку «Стиснуті» поруч з оригіналом", "“Compressed” folder next to original"))
+                            .tag(OutputLocation.nextToOriginal)
                         Text(customFolder.isEmpty ? tr("Вибрану папку…", "Chosen folder…") : URL(fileURLWithPath: customFolder).lastPathComponent)
                             .tag(OutputLocation.customFolder)
                     }
@@ -376,29 +470,11 @@ struct ContentView: View {
                 Text("")
                 Toggle(tr("Зберігати метадані (дата, камера, GPS)", "Keep metadata (date, camera, GPS)"), isOn: $keepMetadata)
             }
-            GridRow {
-                Text(tr("Мова", "Language"))
-                Picker("", selection: $language) {
-                    ForEach(AppLanguage.allCases) { Text($0.title).tag($0) }
-                }
-                .labelsHidden()
-                .fixedSize()
-            }
-            GridRow {
-                Text(tr("Оновлення", "Updates"))
-                HStack(spacing: 12) {
-                    Toggle(tr("Перевіряти автоматично", "Check automatically"), isOn: $autoCheckUpdates)
-                    Button(tr("Перевірити зараз", "Check now")) { Updater.shared.check(userInitiated: true) }
-                        .controlSize(.small)
-                    Text("v" + Updater.currentVersion).foregroundStyle(.secondary).font(.caption)
-                }
-            }
         }
         .disabled(model.isProcessing)
     }
 
     // List / drop zone
-    @ViewBuilder
     private var fileArea: some View {
         Group {
             if model.items.isEmpty {
@@ -412,10 +488,8 @@ struct ContentView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List {
-                    ForEach(model.items) { item in
-                        PhotoRow(item: item, onRemove: { model.remove(item.id) })
-                    }
+                List(model.items) { item in
+                    PhotoRow(item: item, canRemove: !model.isProcessing, onRemove: { model.remove(item.id) })
                 }
                 .listStyle(.inset)
             }
@@ -438,6 +512,10 @@ struct ContentView: View {
             Button { openFiles() } label: { Label(tr("Додати", "Add"), systemImage: "plus") }
             Button(tr("Очистити", "Clear")) { model.clear() }
                 .disabled(model.items.isEmpty || model.isProcessing)
+            if model.scansRunning > 0 {
+                ProgressView().controlSize(.small)
+                Text(tr("Пошук фото…", "Finding photos…")).foregroundStyle(.secondary)
+            }
             Spacer()
             if model.savedBytes > 0 {
                 Text(tr("Зекономлено", "Saved") + " " + formatBytes(model.savedBytes))
@@ -452,10 +530,16 @@ struct ContentView: View {
     }
 
     private func start() {
-        let dir: URL? = (location == .customFolder && !customFolder.isEmpty)
-            ? URL(fileURLWithPath: customFolder, isDirectory: true) : nil
-        model.process(CompressOptions(megapixels: megapixels, format: format, quality: quality,
-                                      keepMetadata: keepMetadata, outputDir: dir))
+        // A number still being typed is only saved when the field loses focus; end editing first,
+        // then read the settings on the next run loop pass.
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        DispatchQueue.main.async {
+            guard megapixels > 0 else { return }
+            let dir: URL? = (location == .customFolder && !customFolder.isEmpty)
+                ? URL(fileURLWithPath: customFolder, isDirectory: true) : nil
+            model.process(CompressOptions(megapixels: megapixels, format: format, quality: quality,
+                                          keepMetadata: keepMetadata, outputDir: dir))
+        }
     }
 
     private func openFiles() {
@@ -483,11 +567,13 @@ struct ContentView: View {
 
 struct PhotoRow: View {
     let item: PhotoItem
+    let canRemove: Bool
     let onRemove: () -> Void
+    @StateObject private var thumbnail = ThumbnailLoader()
 
     var body: some View {
-        HStack(spacing: 10) {
-            statusIcon.frame(width: 20)
+        HStack(spacing: 12) {
+            thumb
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.url.lastPathComponent).lineLimit(1).truncationMode(.middle)
                 Text(details).font(.caption).foregroundStyle(.secondary)
@@ -499,57 +585,94 @@ struct PhotoRow: View {
                 }
                 .buttonStyle(.borderless)
                 .help(tr("Показати у Finder", "Show in Finder"))
-            } else if case .working = item.status {
-                EmptyView()
-            } else {
+            }
+            if canRemove {
                 Button(action: onRemove) { Image(systemName: "xmark") }
                     .buttonStyle(.borderless)
                     .help(tr("Прибрати зі списку", "Remove from list"))
             }
         }
         .padding(.vertical, 2)
+        .task(id: item.url) { await thumbnail.load(item.url) }
     }
 
     private var details: String {
         let mpUnit = tr("Мп", "MP")
         let before = String(format: "%.1f %@ · %@", item.originalMP, mpUnit, formatBytes(item.originalBytes))
-        switch item.status {
-        case .failed(let msg): return "\(before) — \(msg)"
-        default: break
-        }
+        if case .failed(let msg) = item.status { return "\(before) — \(msg)" }
         guard let r = item.result else { return before }
         let mp = Double(r.width * r.height) / 1_000_000
-        let pct = item.originalBytes > 0 ? Int((1 - Double(r.bytes) / Double(item.originalBytes)) * 100) : 0
+        let pct = item.originalBytes > 0 ? Int(((1 - Double(r.bytes) / Double(item.originalBytes)) * 100).rounded()) : 0
         let change = pct >= 0 ? "−\(pct)%" : "+\(-pct)%"
         return String(format: "%@  →  %.1f %@ · %@  (%@)", before, mp, mpUnit, formatBytes(r.bytes), change)
     }
 
-    @ViewBuilder private var statusIcon: some View {
+    private var thumb: some View {
+        ZStack {
+            if let image = thumbnail.image {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Rectangle().fill(Color.secondary.opacity(0.15))
+                Image(systemName: "photo").foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: 48, height: 48)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay(alignment: .bottomTrailing) { statusBadge.offset(x: 5, y: 5) }
+    }
+
+    @ViewBuilder private var statusBadge: some View {
         switch item.status {
-        case .pending: Image(systemName: "photo").foregroundStyle(.secondary)
-        case .working: ProgressView().controlSize(.small)
-        case .done: Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-        case .failed: Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+        case .pending: EmptyView()
+        case .working:
+            ProgressView().controlSize(.mini)
+                .padding(3).background(.regularMaterial, in: Circle())
+        case .done:
+            Image(systemName: "checkmark.circle.fill")
+                .symbolRenderingMode(.palette).foregroundStyle(.white, .green)
+                .font(.system(size: 16))
+        case .failed:
+            Image(systemName: "exclamationmark.circle.fill")
+                .symbolRenderingMode(.palette).foregroundStyle(.white, .orange)
+                .font(.system(size: 16))
         }
     }
 }
 
 // MARK: - App
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     // Files dropped on the Dock icon or opened via "Open With".
     func application(_ application: NSApplication, open urls: [URL]) {
-        Task { @MainActor in AppModel.shared.add(urls) }
+        AppModel.shared.add(urls)
     }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        Task { @MainActor in Updater.shared.checkOnLaunch() }
+        Updater.shared.startAutomaticChecks()
     }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    // Quitting mid-way would leave half-written files, so ask first.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard AppModel.shared.isProcessing else { return .terminateNow }
+        let a = NSAlert()
+        a.messageText = tr("Стиснення ще триває", "Compression is still running")
+        a.informativeText = tr("Якщо вийти зараз, незавершені фото не збережуться.",
+                               "If you quit now, unfinished photos won't be saved.")
+        a.addButton(withTitle: tr("Вийти", "Quit"))
+        a.addButton(withTitle: tr("Скасувати", "Cancel"))
+        return a.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
+    }
 }
 
 @main
 struct PhotoShrinkApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
+    @AppStorage("language") private var language: AppLanguage = .system
 
     var body: some Scene {
         Window("PhotoShrink", id: "main") {
@@ -560,6 +683,10 @@ struct PhotoShrinkApp: App {
             CommandGroup(replacing: .newItem) {}
             CommandGroup(after: .appInfo) {
                 Button(tr("Перевірити оновлення…", "Check for Updates…")) { Updater.shared.check(userInitiated: true) }
+                Divider()
+                Picker(tr("Мова", "Language"), selection: $language) {
+                    ForEach(AppLanguage.allCases) { Text($0.title).tag($0) }
+                }
             }
         }
     }

@@ -6,7 +6,7 @@ APP=build/PhotoShrink.app
 rm -rf build && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 for ARCH in arm64 x86_64; do
-  swiftc -O -parse-as-library -swift-version 5 \
+  swiftc -O -wmo -parse-as-library -swift-version 5 \
     -target $ARCH-apple-macos13.0 \
     Sources/*.swift -o build/PhotoShrink-$ARCH
 done

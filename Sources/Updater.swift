@@ -23,7 +23,6 @@ struct GitHubRelease: Decodable {
     }
     let tag_name: String
     let html_url: URL
-    let body: String?
     let assets: [Asset]
 
     var version: String { tag_name.hasPrefix("v") ? String(tag_name.dropFirst()) : tag_name }
@@ -42,7 +41,7 @@ func isVersion(_ a: String, newerThan b: String) -> Bool {
 }
 
 enum UpdateError: LocalizedError {
-    case noAsset, badArchive, wrongApp, translocated, cannotReplace(String)
+    case noAsset, badArchive, wrongApp, translocated, rateLimited, badResponse, cannotReplace(String)
     var errorDescription: String? {
         switch self {
         case .noAsset: return tr("У релізі немає zip-файлу з програмою", "The release has no app zip file")
@@ -51,6 +50,9 @@ enum UpdateError: LocalizedError {
         case .translocated:
             return tr("Перемістіть PhotoShrink у папку «Програми» і запустіть знову — тоді оновлення встановиться.",
                       "Move PhotoShrink to the Applications folder and open it again, then the update can be installed.")
+        case .rateLimited: return tr("GitHub тимчасово обмежив запити. Спробуйте за годину.",
+                                     "GitHub is limiting requests right now. Try again in an hour.")
+        case .badResponse: return tr("GitHub повернув неочікувану відповідь", "GitHub returned an unexpected response")
         case .cannotReplace(let m): return tr("Не вдалося замінити програму: ", "Could not replace the app: ") + m
         }
     }
@@ -77,20 +79,28 @@ final class Updater: ObservableObject {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
     }
 
-    private var autoCheck: Bool {
-        UserDefaults.standard.object(forKey: "autoCheckUpdates") as? Bool ?? true
+    private static let checkInterval: TimeInterval = 6 * 3600
+    private var timer: Timer?
+
+    /// Quiet checks: on launch and then every 6 hours while the app stays open.
+    func startAutomaticChecks() {
+        checkIfDue()
+        timer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { _ in
+            Task { @MainActor in Updater.shared.checkIfDue() }
+        }
     }
 
-    /// Called on launch: quiet check, at most once every 6 hours.
-    func checkOnLaunch() {
-        guard autoCheck else { return }
+    private func checkIfDue() {
         let last = UserDefaults.standard.double(forKey: "lastUpdateCheck")
-        if Date().timeIntervalSince1970 - last < 6 * 3600 { return }
-        check(userInitiated: false)
+        if Date().timeIntervalSince1970 - last >= Self.checkInterval { check(userInitiated: false) }
     }
 
     func check(userInitiated: Bool) {
-        if state == .checking || state == .installing { return }
+        switch state {
+        case .checking, .installing: return
+        case .available: if !userInitiated { return }   // banner is already shown
+        case .idle: break
+        }
         state = .checking
         Task {
             do {
@@ -98,11 +108,14 @@ final class Updater: ObservableObject {
                 req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
                 req.cachePolicy = .reloadIgnoringLocalCacheData
                 let (data, resp) = try await URLSession.shared.data(for: req)
-                if let http = resp as? HTTPURLResponse, http.statusCode == 404 {
-                    // No releases published yet.
+                switch (resp as? HTTPURLResponse)?.statusCode ?? 0 {
+                case 200: break
+                case 404:   // no releases published yet
                     state = .idle
                     if userInitiated { alert(tr("Оновлень немає", "No updates"), tr("Ще немає опублікованих версій.", "No versions have been published yet.")) }
                     return
+                case 403, 429: throw UpdateError.rateLimited
+                default: throw UpdateError.badResponse
                 }
                 let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
                 UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "lastUpdateCheck")
@@ -134,7 +147,13 @@ final class Updater: ObservableObject {
             do {
                 let (tmpZip, _) = try await URLSession.shared.download(from: zipURL)
                 let newApp = try await Task.detached { try Self.unpackAndVerify(tmpZip, expectedVersion: info.version) }.value
-                try Self.replaceRunningApp(with: newApp)
+                let unpackDir = newApp.deletingLastPathComponent()
+                do { try Self.replaceRunningApp(with: newApp) } catch {
+                    try? FileManager.default.removeItem(at: unpackDir)
+                    throw error
+                }
+                // Clean up before relaunching: terminate() exits the process, so a defer would never run.
+                try? FileManager.default.removeItem(at: unpackDir)
                 Self.relaunch()
             } catch {
                 fail(error, page: info.page)
@@ -174,19 +193,25 @@ final class Updater: ObservableObject {
 
     /// Unzips the download and checks it is really PhotoShrink of the expected version.
     nonisolated private static func unpackAndVerify(_ zip: URL, expectedVersion: String) throws -> URL {
+        defer { try? FileManager.default.removeItem(at: zip) }
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("PhotoShrinkUpdate-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        guard run("/usr/bin/ditto", ["-x", "-k", zip.path, dir.path]) == 0 else { throw UpdateError.badArchive }
+        guard run("/usr/bin/ditto", ["-x", "-k", zip.path, dir.path]) == 0 else {
+            try? FileManager.default.removeItem(at: dir)
+            throw UpdateError.badArchive
+        }
 
         let items = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
         guard let app = items.first(where: { $0.pathExtension == "app" }),
               let newBundle = Bundle(url: app),
               newBundle.bundleIdentifier == Bundle.main.bundleIdentifier,
-              (newBundle.infoDictionary?["CFBundleShortVersionString"] as? String) == expectedVersion
-        else { throw UpdateError.wrongApp }
-
-        // Signature must be intact (catches corrupted or tampered bundles).
-        guard run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path]) == 0 else { throw UpdateError.wrongApp }
+              (newBundle.infoDictionary?["CFBundleShortVersionString"] as? String) == expectedVersion,
+              // Signature must be intact (catches corrupted or tampered bundles).
+              run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path]) == 0
+        else {
+            try? FileManager.default.removeItem(at: dir)
+            throw UpdateError.wrongApp
+        }
         _ = run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", app.path])
         return app
     }
